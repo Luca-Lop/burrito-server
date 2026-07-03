@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-BurritoLauncher - Backend Server v2.0
+BurritoLauncher - Backend Server v2.1
+PostgreSQL (production) + SQLite (local fallback)
 Real-time chat + game platform API
-Deploy on Render/Railway/PythonAnywhere
 """
 
-import os, json, time, hashlib, secrets, sqlite3, threading
+import os, json, time, hashlib, secrets, threading
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
@@ -19,23 +19,128 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "burrito-secret-change-me")
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent",
                     ping_timeout=60, ping_interval=25)
 
-DATABASE = os.environ.get("DB_PATH", "burrito.db")
+# ============================================================
+# DATABASE - PostgreSQL or SQLite
+# ============================================================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES = DATABASE_URL.startswith(("postgresql://", "postgres://"))
 
-# Track connected users for presence
-connected_users = {}  # socket_id -> {"user_id", "username", "rooms"}
+if USE_POSTGRES:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor
+    print("[DB] Using PostgreSQL (persistent, never wipes)")
+else:
+    import sqlite3
+    DATABASE = os.environ.get("DB_PATH", "burrito.db")
+    print("[DB] Using SQLite (local only)")
+
+connected_users = {}
 
 # ============================================================
-# DATABASE
+# DATABASE HELPERS
 # ============================================================
+class DBWrapper:
+    """Wrapper to make PostgreSQL and SQLite work the same way."""
+    def __init__(self, conn):
+        self.conn = conn
+        self.is_postgres = USE_POSTGRES
+    
+    def execute(self, query, params=()):
+        # Convert SQLite ? placeholders to PostgreSQL %s
+        if self.is_postgres:
+            query = self._convert_query(query)
+            cursor = self.conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        return CursorWrapper(cursor, self.is_postgres)
+    
+    def executescript(self, script):
+        if self.is_postgres:
+            cursor = self.conn.cursor()
+            # Split and convert each statement
+            for statement in script.split(';'):
+                s = statement.strip()
+                if s:
+                    s = self._convert_query(s)
+                    try:
+                        cursor.execute(s)
+                    except Exception as e:
+                        print(f"[DB] Skipping: {e}")
+                        self.conn.rollback()
+                        cursor = self.conn.cursor()
+            self.conn.commit()
+        else:
+            self.conn.executescript(script)
+    
+    def commit(self):
+        self.conn.commit()
+    
+    def close(self):
+        self.conn.close()
+    
+    def _convert_query(self, query):
+        """Convert SQLite syntax to PostgreSQL."""
+        # Replace ? with %s
+        query = query.replace("?", "%s")
+        # SQLite AUTOINCREMENT -> PostgreSQL SERIAL
+        query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        # datetime('now') -> NOW()
+        query = query.replace("datetime('now')", "NOW()")
+        # INSERT OR IGNORE -> ON CONFLICT DO NOTHING (rough conversion)
+        query = query.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO" in query and "VALUES" in query and "OR IGNORE" not in query:
+            # Only add ON CONFLICT if we removed OR IGNORE
+            pass
+        # MAX() works in both
+        # PRAGMA statements - skip in PostgreSQL
+        if query.strip().upper().startswith("PRAGMA"):
+            return "SELECT 1"
+        return query
+
+
+class CursorWrapper:
+    """Wrapper to make cursors work the same."""
+    def __init__(self, cursor, is_postgres):
+        self.cursor = cursor
+        self.is_postgres = is_postgres
+        self.lastrowid = None
+        if not is_postgres:
+            self.lastrowid = cursor.lastrowid
+    
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        if self.is_postgres:
+            return dict(row)  # RealDictCursor returns dict-like
+        # For SQLite, use Row factory (already dict-like)
+        return dict(zip([col[0] for col in self.cursor.description], row)) if row else None
+    
+    def fetchall(self):
+        rows = self.cursor.fetchall()
+        if self.is_postgres:
+            return [dict(r) for r in rows]
+        cols = [col[0] for col in self.cursor.description] if self.cursor.description else []
+        return [dict(zip(cols, r)) for r in rows]
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-        g.db.execute("PRAGMA foreign_keys=ON")
+        if USE_POSTGRES:
+            conn = psycopg2.connect(DATABASE_URL)
+        else:
+            conn = sqlite3.connect(DATABASE)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        g.db = DBWrapper(conn)
     return g.db
 
 @app.teardown_appcontext
@@ -44,171 +149,292 @@ def close_db(exc):
     if db: db.close()
 
 def get_db_direct():
-    """For use outside request context (socketio events)."""
-    db = sqlite3.connect(DATABASE)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    return db
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+    else:
+        conn = sqlite3.connect(DATABASE)
+        conn.row_factory = sqlite3.Row
+    return DBWrapper(conn)
+
 
 def init_db():
-    db = sqlite3.connect(DATABASE)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA foreign_keys=ON")
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            display_name TEXT,
-            avatar_color TEXT DEFAULT '#d4841a',
-            bio TEXT DEFAULT '',
-            xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            badges TEXT DEFAULT '["newcomer"]',
-            settings TEXT DEFAULT '{}',
-            created_at TEXT DEFAULT (datetime('now')),
-            last_seen TEXT DEFAULT (datetime('now')),
-            auth_token TEXT UNIQUE,
-            status TEXT DEFAULT 'offline'
-        );
-        
-        CREATE TABLE IF NOT EXISTS games (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            version TEXT DEFAULT '1.0.0',
-            author TEXT DEFAULT '',
-            author_id INTEGER,
-            tags TEXT DEFAULT '[]',
-            category TEXT DEFAULT 'general',
-            multiplayer INTEGER DEFAULT 0,
-            controls INTEGER DEFAULT 0,
-            controller_support INTEGER DEFAULT 0,
-            micropython INTEGER DEFAULT 0,
-            file_data TEXT DEFAULT '',
-            download_url TEXT DEFAULT '',
-            thumbnail_url TEXT DEFAULT '',
-            total_plays INTEGER DEFAULT 0,
-            rating REAL DEFAULT 0,
-            added_at TEXT DEFAULT (datetime('now')),
-            is_active INTEGER DEFAULT 1,
-            FOREIGN KEY (author_id) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS user_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            game_id TEXT NOT NULL,
-            total_plays INTEGER DEFAULT 0,
-            total_playtime_seconds REAL DEFAULT 0,
-            last_played TEXT,
-            high_score REAL DEFAULT 0,
-            custom_data TEXT DEFAULT '{}',
-            updated_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, game_id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS play_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            game_id TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            duration_seconds REAL DEFAULT 0,
-            score REAL DEFAULT 0,
-            synced_from_offline INTEGER DEFAULT 0,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS play_log_weekly (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT NOT NULL,
-            played_at TEXT DEFAULT (datetime('now')),
-            user_id INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS friends (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            friend_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (friend_id) REFERENCES users(id),
-            UNIQUE(user_id, friend_id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS chat_rooms (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id TEXT UNIQUE NOT NULL,
-            room_type TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            created_by INTEGER,
-            game_id TEXT DEFAULT NULL,
-            max_members INTEGER DEFAULT 50,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (created_by) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS chat_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            role TEXT DEFAULT 'member',
-            joined_at TEXT DEFAULT (datetime('now')),
-            UNIQUE(room_id, user_id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            username TEXT NOT NULL,
-            display_name TEXT DEFAULT '',
-            avatar_color TEXT DEFAULT '#d4841a',
-            message TEXT NOT NULL,
-            message_type TEXT DEFAULT 'text',
-            sent_at TEXT DEFAULT (datetime('now')),
-            edited INTEGER DEFAULT 0,
-            deleted INTEGER DEFAULT 0
-        );
-        
-        CREATE TABLE IF NOT EXISTS user_library (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            game_id TEXT NOT NULL,
-            installed INTEGER DEFAULT 0,
-            added_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, game_id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS sync_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            synced_at TEXT DEFAULT (datetime('now')),
-            items_synced INTEGER DEFAULT 0,
-            sync_type TEXT DEFAULT 'normal',
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS game_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            file_content TEXT,
-            file_size INTEGER DEFAULT 0,
-            is_main INTEGER DEFAULT 0,
-            uploaded_at TEXT DEFAULT (datetime('now'))
-        );
-    """)
+    """Create tables (works for both PostgreSQL and SQLite)."""
+    db = get_db_direct()
     
-    # Create default rooms
+    if USE_POSTGRES:
+        # PostgreSQL schema
+        schema = """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT,
+                avatar_color TEXT DEFAULT '#d4841a',
+                bio TEXT DEFAULT '',
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                badges TEXT DEFAULT '["newcomer"]',
+                settings TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_seen TIMESTAMP DEFAULT NOW(),
+                auth_token TEXT UNIQUE,
+                status TEXT DEFAULT 'offline'
+            );
+            CREATE TABLE IF NOT EXISTS games (
+                id SERIAL PRIMARY KEY,
+                game_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                version TEXT DEFAULT '1.0.0',
+                author TEXT DEFAULT '',
+                author_id INTEGER,
+                tags TEXT DEFAULT '[]',
+                category TEXT DEFAULT 'general',
+                multiplayer INTEGER DEFAULT 0,
+                controls INTEGER DEFAULT 0,
+                controller_support INTEGER DEFAULT 0,
+                micropython INTEGER DEFAULT 0,
+                file_data TEXT DEFAULT '',
+                download_url TEXT DEFAULT '',
+                thumbnail_url TEXT DEFAULT '',
+                total_plays INTEGER DEFAULT 0,
+                rating REAL DEFAULT 0,
+                added_at TIMESTAMP DEFAULT NOW(),
+                is_active INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS user_stats (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                total_plays INTEGER DEFAULT 0,
+                total_playtime_seconds REAL DEFAULT 0,
+                last_played TIMESTAMP,
+                high_score REAL DEFAULT 0,
+                custom_data TEXT DEFAULT '{}',
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, game_id)
+            );
+            CREATE TABLE IF NOT EXISTS play_sessions (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_seconds REAL DEFAULT 0,
+                score REAL DEFAULT 0,
+                synced_from_offline INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS play_log_weekly (
+                id SERIAL PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                played_at TIMESTAMP DEFAULT NOW(),
+                user_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS friends (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                friend_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, friend_id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_rooms (
+                id SERIAL PRIMARY KEY,
+                room_id TEXT UNIQUE NOT NULL,
+                room_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                created_by INTEGER,
+                game_id TEXT DEFAULT NULL,
+                max_members INTEGER DEFAULT 50,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS chat_members (
+                id SERIAL PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT DEFAULT 'member',
+                joined_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(room_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                display_name TEXT DEFAULT '',
+                avatar_color TEXT DEFAULT '#d4841a',
+                message TEXT NOT NULL,
+                message_type TEXT DEFAULT 'text',
+                sent_at TIMESTAMP DEFAULT NOW(),
+                edited INTEGER DEFAULT 0,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_library (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                installed INTEGER DEFAULT 0,
+                added_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, game_id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                synced_at TIMESTAMP DEFAULT NOW(),
+                items_synced INTEGER DEFAULT 0,
+                sync_type TEXT DEFAULT 'normal'
+            );
+            CREATE TABLE IF NOT EXISTS game_files (
+                id SERIAL PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_content TEXT,
+                file_size INTEGER DEFAULT 0,
+                is_main INTEGER DEFAULT 0,
+                uploaded_at TIMESTAMP DEFAULT NOW()
+            );
+        """
+    else:
+        # SQLite schema (original)
+        schema = """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT,
+                avatar_color TEXT DEFAULT '#d4841a',
+                bio TEXT DEFAULT '',
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                badges TEXT DEFAULT '["newcomer"]',
+                settings TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                last_seen TEXT DEFAULT (datetime('now')),
+                auth_token TEXT UNIQUE,
+                status TEXT DEFAULT 'offline'
+            );
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                version TEXT DEFAULT '1.0.0',
+                author TEXT DEFAULT '',
+                author_id INTEGER,
+                tags TEXT DEFAULT '[]',
+                category TEXT DEFAULT 'general',
+                multiplayer INTEGER DEFAULT 0,
+                controls INTEGER DEFAULT 0,
+                controller_support INTEGER DEFAULT 0,
+                micropython INTEGER DEFAULT 0,
+                file_data TEXT DEFAULT '',
+                download_url TEXT DEFAULT '',
+                thumbnail_url TEXT DEFAULT '',
+                total_plays INTEGER DEFAULT 0,
+                rating REAL DEFAULT 0,
+                added_at TEXT DEFAULT (datetime('now')),
+                is_active INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS user_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                total_plays INTEGER DEFAULT 0,
+                total_playtime_seconds REAL DEFAULT 0,
+                last_played TEXT,
+                high_score REAL DEFAULT 0,
+                custom_data TEXT DEFAULT '{}',
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(user_id, game_id)
+            );
+            CREATE TABLE IF NOT EXISTS play_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_seconds REAL DEFAULT 0,
+                score REAL DEFAULT 0,
+                synced_from_offline INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS play_log_weekly (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT NOT NULL,
+                played_at TEXT DEFAULT (datetime('now')),
+                user_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS friends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                friend_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(user_id, friend_id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT UNIQUE NOT NULL,
+                room_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                created_by INTEGER,
+                game_id TEXT DEFAULT NULL,
+                max_members INTEGER DEFAULT 50,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS chat_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT DEFAULT 'member',
+                joined_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(room_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                display_name TEXT DEFAULT '',
+                avatar_color TEXT DEFAULT '#d4841a',
+                message TEXT NOT NULL,
+                message_type TEXT DEFAULT 'text',
+                sent_at TEXT DEFAULT (datetime('now')),
+                edited INTEGER DEFAULT 0,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_library (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                installed INTEGER DEFAULT 0,
+                added_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(user_id, game_id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                synced_at TEXT DEFAULT (datetime('now')),
+                items_synced INTEGER DEFAULT 0,
+                sync_type TEXT DEFAULT 'normal'
+            );
+            CREATE TABLE IF NOT EXISTS game_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_content TEXT,
+                file_size INTEGER DEFAULT 0,
+                is_main INTEGER DEFAULT 0,
+                uploaded_at TEXT DEFAULT (datetime('now'))
+            );
+        """
+    
+    db.executescript(schema)
+    
+    # Create default chat rooms
     default_rooms = [
         ("global_support", "support", "Support", "Get help with BurritoLauncher"),
         ("global_feedback", "feedback", "Feedback", "Share your ideas and feedback"),
@@ -216,18 +442,28 @@ def init_db():
         ("global_records", "community", "Records & Completions", "Show off your achievements"),
     ]
     for room_id, rtype, name, desc in default_rooms:
-        db.execute("""INSERT OR IGNORE INTO chat_rooms 
-                      (room_id, room_type, name, description, created_by)
-                      VALUES (?, ?, ?, ?, NULL)""",
-                   (room_id, rtype, name, desc))
+        try:
+            if USE_POSTGRES:
+                db.execute("""INSERT INTO chat_rooms 
+                    (room_id, room_type, name, description, created_by)
+                    VALUES (?, ?, ?, ?, NULL)
+                    ON CONFLICT (room_id) DO NOTHING""",
+                    (room_id, rtype, name, desc))
+            else:
+                db.execute("""INSERT OR IGNORE INTO chat_rooms 
+                    (room_id, room_type, name, description, created_by)
+                    VALUES (?, ?, ?, ?, NULL)""",
+                    (room_id, rtype, name, desc))
+            db.commit()
+        except Exception as e:
+            print(f"[DB] Room {room_id}: {e}")
     
-    db.commit()
     db.close()
     print("[DB] Database initialized with chat rooms")
 
 
 # ============================================================
-# AUTH HELPERS
+# AUTH
 # ============================================================
 def hash_pw(pw):
     salt = app.config["SECRET_KEY"].encode()
@@ -246,19 +482,20 @@ def require_auth(f):
         user = db.execute("SELECT * FROM users WHERE auth_token = ?", (token,)).fetchone()
         if not user:
             return jsonify({"error": "Invalid token"}), 401
-        db.execute("UPDATE users SET last_seen = datetime('now') WHERE id = ?", (user["id"],))
+        db.execute("UPDATE users SET last_seen = " + 
+                   ("NOW()" if USE_POSTGRES else "datetime('now')") + 
+                   " WHERE id = ?", (user["id"],))
         db.commit()
-        g.current_user = dict(user)
+        g.current_user = user
         return f(*args, **kwargs)
     return decorated
 
 def get_user_from_token(token):
-    """For socketio auth."""
     if not token: return None
     db = get_db_direct()
     user = db.execute("SELECT * FROM users WHERE auth_token = ?", (token,)).fetchone()
     db.close()
-    return dict(user) if user else None
+    return user
 
 
 # ============================================================
@@ -266,8 +503,9 @@ def get_user_from_token(token):
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"name": "BurritoLauncher API", "version": "2.0.0",
+    return jsonify({"name": "BurritoLauncher API", "version": "2.1.0",
                     "status": "online", "chat": "socketio",
+                    "database": "postgresql" if USE_POSTGRES else "sqlite",
                     "time": datetime.utcnow().isoformat()})
 
 @app.route("/api/ping")
@@ -302,23 +540,26 @@ def register():
     db.commit()
     
     user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    user_dict = dict(user)
     
-    # Auto-join global rooms
     for room_id in ["global_support", "global_feedback", "global_tricks", "global_records"]:
-        db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
-                   (room_id, user_dict["id"]))
+        try:
+            if USE_POSTGRES:
+                db.execute("""INSERT INTO chat_members (room_id, user_id) VALUES (?, ?)
+                              ON CONFLICT DO NOTHING""", (room_id, user["id"]))
+            else:
+                db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
+                           (room_id, user["id"]))
+        except: pass
     db.commit()
     
     return jsonify({
         "success": True,
         "user": {
-            "id": user_dict["id"], "username": user_dict["username"],
-            "display_name": user_dict["display_name"],
-            "avatar_color": user_dict["avatar_color"],
+            "id": user["id"], "username": user["username"],
+            "display_name": user["display_name"], "avatar_color": user["avatar_color"],
             "token": token, "xp": 0, "level": 1,
-            "badges": json.loads(user_dict["badges"]),
-            "bio": "", "created_at": user_dict["created_at"]
+            "badges": json.loads(user["badges"]) if isinstance(user["badges"], str) else user["badges"],
+            "bio": "", "created_at": str(user["created_at"])
         }
     }), 201
 
@@ -334,21 +575,22 @@ def login():
         return jsonify({"error": "Invalid username or password"}), 401
     
     token = gen_token()
-    db.execute("UPDATE users SET auth_token = ?, last_seen = datetime('now'), status = 'online' WHERE id = ?",
-               (token, user["id"]))
+    if USE_POSTGRES:
+        db.execute("UPDATE users SET auth_token = ?, last_seen = NOW(), status = 'online' WHERE id = ?",
+                   (token, user["id"]))
+    else:
+        db.execute("UPDATE users SET auth_token = ?, last_seen = datetime('now'), status = 'online' WHERE id = ?",
+                   (token, user["id"]))
     db.commit()
     
-    user_dict = dict(user)
     return jsonify({
         "success": True,
         "user": {
-            "id": user_dict["id"], "username": user_dict["username"],
-            "display_name": user_dict["display_name"],
-            "avatar_color": user_dict["avatar_color"],
-            "bio": user_dict["bio"], "xp": user_dict["xp"],
-            "level": user_dict["level"],
-            "badges": json.loads(user_dict["badges"]),
-            "token": token, "created_at": user_dict["created_at"]
+            "id": user["id"], "username": user["username"],
+            "display_name": user["display_name"], "avatar_color": user["avatar_color"],
+            "bio": user["bio"], "xp": user["xp"], "level": user["level"],
+            "badges": json.loads(user["badges"]) if isinstance(user["badges"], str) else user["badges"],
+            "token": token, "created_at": str(user["created_at"])
         }
     })
 
@@ -360,8 +602,9 @@ def get_me():
         "id": u["id"], "username": u["username"],
         "display_name": u["display_name"], "avatar_color": u["avatar_color"],
         "bio": u["bio"], "xp": u["xp"], "level": u["level"],
-        "badges": json.loads(u["badges"]), "status": u["status"],
-        "created_at": u["created_at"], "last_seen": u["last_seen"]
+        "badges": json.loads(u["badges"]) if isinstance(u["badges"], str) else u["badges"],
+        "status": u["status"], "created_at": str(u["created_at"]),
+        "last_seen": str(u["last_seen"])
     })
 
 @app.route("/api/auth/profile", methods=["PUT"])
@@ -413,7 +656,7 @@ def get_friends():
         WHERE (f.user_id = ? OR f.friend_id = ?) AND f.status = 'accepted'
     """, (uid, uid, uid)).fetchall()
     
-    return jsonify({"friends": [dict(f) for f in friends]})
+    return jsonify({"friends": friends})
 
 @app.route("/api/friends/requests")
 @require_auth
@@ -433,10 +676,7 @@ def get_friend_requests():
         WHERE f.user_id = ? AND f.status = 'pending'
     """, (uid,)).fetchall()
     
-    return jsonify({
-        "incoming": [dict(r) for r in incoming],
-        "outgoing": [dict(r) for r in outgoing]
-    })
+    return jsonify({"incoming": incoming, "outgoing": outgoing})
 
 @app.route("/api/friends/add", methods=["POST"])
 @require_auth
@@ -459,11 +699,9 @@ def add_friend():
         if existing["status"] == "accepted":
             return jsonify({"error": "Already friends"}), 409
         if existing["status"] == "pending":
-            # If they sent us a request, accept it
             if existing["friend_id"] == uid:
                 db.execute("UPDATE friends SET status = 'accepted' WHERE id = ?", (existing["id"],))
                 db.commit()
-                # Notify via socketio
                 socketio.emit("friend_accepted", {
                     "username": g.current_user["username"],
                     "display_name": g.current_user["display_name"]
@@ -475,7 +713,6 @@ def add_friend():
                (uid, other["id"]))
     db.commit()
     
-    # Notify via socketio
     socketio.emit("friend_request", {
         "from_username": g.current_user["username"],
         "from_display_name": g.current_user["display_name"],
@@ -512,7 +749,7 @@ def search_users():
         FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 20
     """, (f"%{query}%", f"%{query}%")).fetchall()
     
-    return jsonify({"users": [dict(u) for u in users]})
+    return jsonify({"users": users})
 
 
 # ============================================================
@@ -524,56 +761,60 @@ def list_games():
     games = db.execute(
         "SELECT * FROM games WHERE is_active = 1 ORDER BY total_plays DESC"
     ).fetchall()
-    result = []
     for g_row in games:
-        gd = dict(g_row)
-        gd["tags"] = json.loads(gd.get("tags", "[]"))
-        result.append(gd)
-    return jsonify({"games": result})
+        try: g_row["tags"] = json.loads(g_row.get("tags", "[]"))
+        except: g_row["tags"] = []
+    return jsonify({"games": games})
 
 @app.route("/api/games/trending")
 def trending_games():
-    """Games with most plays in last 7 days."""
     db = get_db()
-    week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    if USE_POSTGRES:
+        week_ago = "NOW() - INTERVAL '7 days'"
+        query = f"""
+            SELECT g.*, COUNT(p.id) as weekly_plays
+            FROM games g
+            LEFT JOIN play_log_weekly p ON g.game_id = p.game_id AND p.played_at > {week_ago}
+            WHERE g.is_active = 1
+            GROUP BY g.id
+            ORDER BY weekly_plays DESC
+            LIMIT 50
+        """
+        trending = db.execute(query).fetchall()
+    else:
+        week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        trending = db.execute("""
+            SELECT g.*, COUNT(p.id) as weekly_plays
+            FROM games g
+            LEFT JOIN play_log_weekly p ON g.game_id = p.game_id AND p.played_at > ?
+            WHERE g.is_active = 1
+            GROUP BY g.game_id
+            ORDER BY weekly_plays DESC
+            LIMIT 50
+        """, (week_ago,)).fetchall()
     
-    trending = db.execute("""
-        SELECT g.*, COUNT(p.id) as weekly_plays
-        FROM games g
-        LEFT JOIN play_log_weekly p ON g.game_id = p.game_id AND p.played_at > ?
-        WHERE g.is_active = 1
-        GROUP BY g.game_id
-        ORDER BY weekly_plays DESC
-        LIMIT 50
-    """, (week_ago,)).fetchall()
-    
-    result = []
     for row in trending:
-        d = dict(row)
-        d["tags"] = json.loads(d.get("tags", "[]"))
-        result.append(d)
+        try: row["tags"] = json.loads(row.get("tags", "[]"))
+        except: row["tags"] = []
     
-    return jsonify({"trending": result, "period": "7_days"})
+    return jsonify({"trending": trending, "period": "7_days"})
 
 @app.route("/api/games/<game_id>")
 def get_game(game_id):
     db = get_db()
     game = db.execute("SELECT * FROM games WHERE game_id = ?", (game_id,)).fetchone()
     if not game: return jsonify({"error": "Game not found"}), 404
-    gd = dict(game)
-    gd["tags"] = json.loads(gd.get("tags", "[]"))
+    try: game["tags"] = json.loads(game.get("tags", "[]"))
+    except: game["tags"] = []
     
-    # Get game files
     files = db.execute("SELECT file_name, is_main FROM game_files WHERE game_id = ?",
                        (game_id,)).fetchall()
-    gd["files"] = [dict(f) for f in files]
-    
-    return jsonify(gd)
+    game["files"] = files
+    return jsonify(game)
 
 @app.route("/api/games", methods=["POST"])
 @require_auth
 def post_game():
-    """Post a new game with its file contents."""
     data = request.get_json() or {}
     
     game_id = data.get("game_id", "").strip().lower().replace(" ", "_")
@@ -584,7 +825,6 @@ def post_game():
     db = get_db()
     uid = g.current_user["id"]
     
-    # Check if game exists
     existing = db.execute("SELECT id FROM games WHERE game_id = ?", (game_id,)).fetchone()
     if existing:
         return jsonify({"error": "A game with this ID already exists"}), 409
@@ -603,7 +843,6 @@ def post_game():
          1 if data.get("controller_support") else 0,
          1 if data.get("micropython") else 0))
     
-    # Store game files if provided
     files = data.get("files", {})
     main_file = data.get("main_file", "")
     
@@ -614,20 +853,19 @@ def post_game():
             VALUES (?, ?, ?, ?, ?, ?)""",
             (game_id, fname, fname, content, len(content), is_main))
     
-    # Update user badges and XP
-    badges = json.loads(g.current_user["badges"])
-    if "creator" not in badges:
-        badges.append("creator")
-        db.execute("UPDATE users SET badges = ? WHERE id = ?", (json.dumps(badges), uid))
+    try:
+        badges = json.loads(g.current_user["badges"]) if isinstance(g.current_user["badges"], str) else g.current_user["badges"]
+        if "creator" not in badges:
+            badges.append("creator")
+            db.execute("UPDATE users SET badges = ? WHERE id = ?", (json.dumps(badges), uid))
+    except: pass
     db.execute("UPDATE users SET xp = xp + 50 WHERE id = ?", (uid,))
-    
     db.commit()
     
     return jsonify({"success": True, "game_id": game_id}), 201
 
 @app.route("/api/games/<game_id>/files")
 def get_game_files(game_id):
-    """Get all files for a game (for streaming play)."""
     db = get_db()
     files = db.execute(
         "SELECT file_name, file_content, is_main FROM game_files WHERE game_id = ?",
@@ -654,13 +892,14 @@ def get_game_files(game_id):
 def get_stats():
     db = get_db()
     stats = db.execute(
+        "SELECT * FROM user_stats WHERE user_id = ? ORDER BY last_played DESC NULLS LAST" if USE_POSTGRES else
         "SELECT * FROM user_stats WHERE user_id = ? ORDER BY last_played DESC",
         (g.current_user["id"],)).fetchall()
     result = {}
     for s in stats:
-        sd = dict(s)
-        sd["custom_data"] = json.loads(sd.get("custom_data", "{}"))
-        result[sd["game_id"]] = sd
+        try: s["custom_data"] = json.loads(s.get("custom_data", "{}"))
+        except: s["custom_data"] = {}
+        result[s["game_id"]] = s
     return jsonify({"stats": result})
 
 @app.route("/api/stats/<game_id>/play", methods=["POST"])
@@ -672,44 +911,45 @@ def record_play(game_id):
     duration = data.get("duration_seconds", 0)
     score = data.get("score", 0)
     
-    # Log session
     db.execute("""INSERT INTO play_sessions 
         (user_id, game_id, started_at, duration_seconds, score, synced_from_offline)
         VALUES (?, ?, ?, ?, ?, ?)""",
         (uid, game_id, data.get("started_at", datetime.utcnow().isoformat()),
          duration, score, 1 if data.get("from_offline") else 0))
     
-    # Weekly log for trending
     db.execute("INSERT INTO play_log_weekly (game_id, user_id) VALUES (?, ?)",
                (game_id, uid))
     
-    # Update user stats
     existing = db.execute(
         "SELECT * FROM user_stats WHERE user_id = ? AND game_id = ?",
         (uid, game_id)).fetchone()
     
+    now_func = "NOW()" if USE_POSTGRES else "datetime('now')"
+    
     if existing:
-        db.execute("""UPDATE user_stats SET 
+        db.execute(f"""UPDATE user_stats SET 
             total_plays = total_plays + 1,
             total_playtime_seconds = total_playtime_seconds + ?,
-            last_played = datetime('now'),
+            last_played = {now_func},
+            high_score = GREATEST(high_score, ?),
+            updated_at = {now_func}
+            WHERE user_id = ? AND game_id = ?""" if USE_POSTGRES else f"""UPDATE user_stats SET 
+            total_plays = total_plays + 1,
+            total_playtime_seconds = total_playtime_seconds + ?,
+            last_played = {now_func},
             high_score = MAX(high_score, ?),
-            updated_at = datetime('now')
+            updated_at = {now_func}
             WHERE user_id = ? AND game_id = ?""",
             (duration, score, uid, game_id))
     else:
-        db.execute("""INSERT INTO user_stats 
+        db.execute(f"""INSERT INTO user_stats 
             (user_id, game_id, total_plays, total_playtime_seconds, last_played, high_score)
-            VALUES (?, ?, 1, ?, datetime('now'), ?)""",
+            VALUES (?, ?, 1, ?, {now_func}, ?)""",
             (uid, game_id, duration, score))
     
-    # Update global play count
     db.execute("UPDATE games SET total_plays = total_plays + 1 WHERE game_id = ?",
                (game_id,))
-    
-    # XP
     db.execute("UPDATE users SET xp = xp + 5, level = 1 + (xp + 5) / 100 WHERE id = ?", (uid,))
-    
     db.commit()
     return jsonify({"success": True})
 
@@ -720,6 +960,8 @@ def sync_offline():
     db = get_db()
     uid = g.current_user["id"]
     synced = 0
+    now_func = "NOW()" if USE_POSTGRES else "datetime('now')"
+    max_func = "GREATEST" if USE_POSTGRES else "MAX"
     
     for session in data.get("play_sessions", []):
         game_id = session.get("game_id", "")
@@ -741,16 +983,16 @@ def sync_offline():
             (uid, game_id)).fetchone()
         
         if existing:
-            db.execute("""UPDATE user_stats SET 
+            db.execute(f"""UPDATE user_stats SET 
                 total_plays = total_plays + ?, total_playtime_seconds = total_playtime_seconds + ?,
-                last_played = datetime('now'), high_score = MAX(high_score, ?),
-                updated_at = datetime('now')
+                last_played = {now_func}, high_score = {max_func}(high_score, ?),
+                updated_at = {now_func}
                 WHERE user_id = ? AND game_id = ?""",
                 (plays, playtime, score, uid, game_id))
         else:
-            db.execute("""INSERT INTO user_stats 
+            db.execute(f"""INSERT INTO user_stats 
                 (user_id, game_id, total_plays, total_playtime_seconds, last_played, high_score)
-                VALUES (?, ?, ?, ?, datetime('now'), ?)""",
+                VALUES (?, ?, ?, ?, {now_func}, ?)""",
                 (uid, game_id, plays, playtime, score))
         
         db.execute("UPDATE games SET total_plays = total_plays + ? WHERE game_id = ?",
@@ -771,11 +1013,11 @@ def leaderboard(game_id):
         FROM user_stats us JOIN users u ON us.user_id = u.id
         WHERE us.game_id = ? ORDER BY us.high_score DESC LIMIT 50
     """, (game_id,)).fetchall()
-    return jsonify({"game_id": game_id, "leaderboard": [dict(r) for r in rows]})
+    return jsonify({"game_id": game_id, "leaderboard": rows})
 
 
 # ============================================================
-# ROUTES - CHAT (REST endpoints for history)
+# ROUTES - CHAT
 # ============================================================
 @app.route("/api/chat/rooms")
 @require_auth
@@ -783,8 +1025,18 @@ def get_chat_rooms():
     db = get_db()
     uid = g.current_user["id"]
     
-    # Rooms user is a member of
     rooms = db.execute("""
+        SELECT cr.*, cm.role,
+            (SELECT COUNT(*) FROM chat_members WHERE room_id = cr.room_id) as member_count,
+            (SELECT message FROM chat_messages WHERE room_id = cr.room_id 
+             ORDER BY id DESC LIMIT 1) as last_message,
+            (SELECT sent_at FROM chat_messages WHERE room_id = cr.room_id 
+             ORDER BY id DESC LIMIT 1) as last_message_time
+        FROM chat_rooms cr
+        JOIN chat_members cm ON cr.room_id = cm.room_id AND cm.user_id = ?
+        WHERE cr.is_active = 1
+        ORDER BY last_message_time DESC NULLS LAST
+    """ if USE_POSTGRES else """
         SELECT cr.*, cm.role,
             (SELECT COUNT(*) FROM chat_members WHERE room_id = cr.room_id) as member_count,
             (SELECT message FROM chat_messages WHERE room_id = cr.room_id 
@@ -797,7 +1049,7 @@ def get_chat_rooms():
         ORDER BY last_message_time DESC
     """, (uid,)).fetchall()
     
-    return jsonify({"rooms": [dict(r) for r in rooms]})
+    return jsonify({"rooms": rooms})
 
 @app.route("/api/chat/rooms", methods=["POST"])
 @require_auth
@@ -815,16 +1067,18 @@ def create_chat_room():
     room_id = f"{room_type}_{uid}_{int(time.time())}"
     if game_id:
         room_id = f"game_{game_id}"
-    
-    # Check if game room already exists
-    if game_id:
         existing = db.execute("SELECT room_id FROM chat_rooms WHERE game_id = ?",
                              (game_id,)).fetchone()
         if existing:
-            # Just join it
-            db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id, role) VALUES (?, ?, 'member')",
-                       (existing["room_id"], uid))
-            db.commit()
+            try:
+                if USE_POSTGRES:
+                    db.execute("INSERT INTO chat_members (room_id, user_id, role) VALUES (?, ?, 'member') ON CONFLICT DO NOTHING",
+                               (existing["room_id"], uid))
+                else:
+                    db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id, role) VALUES (?, ?, 'member')",
+                               (existing["room_id"], uid))
+                db.commit()
+            except: pass
             return jsonify({"success": True, "room_id": existing["room_id"]})
     
     db.execute("""INSERT INTO chat_rooms 
@@ -832,18 +1086,21 @@ def create_chat_room():
         VALUES (?, ?, ?, ?, ?, ?)""",
         (room_id, room_type, name, data.get("description", ""), uid, game_id))
     
-    # Creator is admin
     db.execute("INSERT INTO chat_members (room_id, user_id, role) VALUES (?, ?, 'admin')",
                (room_id, uid))
     
-    # Add invited members
     for invite_username in data.get("invite", []):
         invited = db.execute("SELECT id FROM users WHERE username = ?",
                             (invite_username.strip().lower(),)).fetchone()
         if invited:
-            db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
-                       (room_id, invited["id"]))
-            # Notify
+            try:
+                if USE_POSTGRES:
+                    db.execute("INSERT INTO chat_members (room_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                               (room_id, invited["id"]))
+                else:
+                    db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
+                               (room_id, invited["id"]))
+            except: pass
             socketio.emit("room_invite", {
                 "room_id": room_id, "room_name": name,
                 "invited_by": g.current_user["display_name"]
@@ -858,12 +1115,10 @@ def get_messages(room_id):
     db = get_db()
     uid = g.current_user["id"]
     
-    # Check membership
     member = db.execute(
         "SELECT * FROM chat_members WHERE room_id = ? AND user_id = ?",
         (room_id, uid)).fetchone()
     
-    # Allow access to global rooms
     if not member and not room_id.startswith("global_"):
         return jsonify({"error": "Not a member of this room"}), 403
     
@@ -883,7 +1138,10 @@ def get_messages(room_id):
             ORDER BY id DESC LIMIT ?
         """, (room_id, limit)).fetchall()
     
-    return jsonify({"messages": [dict(m) for m in reversed(messages)]})
+    for m in messages:
+        if "sent_at" in m: m["sent_at"] = str(m["sent_at"])
+    
+    return jsonify({"messages": list(reversed(messages))})
 
 @app.route("/api/chat/<room_id>/invite", methods=["POST"])
 @require_auth
@@ -894,7 +1152,6 @@ def invite_to_room(room_id):
     db = get_db()
     uid = g.current_user["id"]
     
-    # Check if inviter is member
     member = db.execute(
         "SELECT role FROM chat_members WHERE room_id = ? AND user_id = ?",
         (room_id, uid)).fetchone()
@@ -905,9 +1162,15 @@ def invite_to_room(room_id):
     if not invited:
         return jsonify({"error": "User not found"}), 404
     
-    db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
-               (room_id, invited["id"]))
-    db.commit()
+    try:
+        if USE_POSTGRES:
+            db.execute("INSERT INTO chat_members (room_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                       (room_id, invited["id"]))
+        else:
+            db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
+                       (room_id, invited["id"]))
+        db.commit()
+    except: pass
     
     room = db.execute("SELECT name FROM chat_rooms WHERE room_id = ?", (room_id,)).fetchone()
     socketio.emit("room_invite", {
@@ -921,7 +1184,6 @@ def invite_to_room(room_id):
 @app.route("/api/chat/game/<game_id>")
 @require_auth
 def get_or_create_game_chat(game_id):
-    """Get or create a chat room for a specific game."""
     db = get_db()
     uid = g.current_user["id"]
     
@@ -939,16 +1201,21 @@ def get_or_create_game_chat(game_id):
         db.commit()
         room = db.execute("SELECT * FROM chat_rooms WHERE room_id = ?", (room_id,)).fetchone()
     
-    # Auto-join
-    db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
-               (room["room_id"], uid))
-    db.commit()
+    try:
+        if USE_POSTGRES:
+            db.execute("INSERT INTO chat_members (room_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                       (room["room_id"], uid))
+        else:
+            db.execute("INSERT OR IGNORE INTO chat_members (room_id, user_id) VALUES (?, ?)",
+                       (room["room_id"], uid))
+        db.commit()
+    except: pass
     
-    return jsonify(dict(room))
+    return jsonify(room)
 
 
 # ============================================================
-# SOCKETIO - REAL-TIME CHAT
+# SOCKETIO
 # ============================================================
 @socketio.on("connect")
 def handle_connect():
@@ -956,7 +1223,7 @@ def handle_connect():
     user = get_user_from_token(token)
     
     if not user:
-        return False  # Reject connection
+        return False
     
     connected_users[request.sid] = {
         "user_id": user["id"],
@@ -966,10 +1233,8 @@ def handle_connect():
         "rooms": set()
     }
     
-    # Join personal room for notifications
     join_room(f"user_{user['id']}")
     
-    # Update status
     db = get_db_direct()
     db.execute("UPDATE users SET status = 'online' WHERE id = ?", (user["id"],))
     db.commit()
@@ -982,12 +1247,12 @@ def handle_disconnect():
     user_data = connected_users.pop(request.sid, None)
     if user_data:
         db = get_db_direct()
-        db.execute("UPDATE users SET status = 'offline', last_seen = datetime('now') WHERE id = ?",
+        now_func = "NOW()" if USE_POSTGRES else "datetime('now')"
+        db.execute(f"UPDATE users SET status = 'offline', last_seen = {now_func} WHERE id = ?",
                    (user_data["user_id"],))
         db.commit()
         db.close()
         
-        # Notify rooms
         for room_id in user_data.get("rooms", set()):
             emit("user_left", {
                 "username": user_data["username"],
@@ -1011,7 +1276,6 @@ def handle_join_room(data):
         "avatar_color": user_data["avatar_color"]
     }, room=room_id)
     
-    # Send current online users in room
     online_in_room = []
     for sid, ud in connected_users.items():
         if room_id in ud.get("rooms", set()):
@@ -1045,31 +1309,33 @@ def handle_send_message(data):
     user_data = connected_users.get(request.sid)
     if not user_data or not message: return
     
-    # Rate limit: max 5 messages per second
-    # (simple check, production would use Redis)
-    
-    # Save to database
     db = get_db_direct()
-    cursor = db.execute("""INSERT INTO chat_messages 
-        (room_id, user_id, username, display_name, avatar_color, message, message_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (room_id, user_data["user_id"], user_data["username"],
-         user_data["display_name"], user_data["avatar_color"],
-         message, msg_type))
-    msg_id = cursor.lastrowid
+    if USE_POSTGRES:
+        cursor = db.execute("""INSERT INTO chat_messages 
+            (room_id, user_id, username, display_name, avatar_color, message, message_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+            (room_id, user_data["user_id"], user_data["username"],
+             user_data["display_name"], user_data["avatar_color"],
+             message, msg_type))
+        msg_id = cursor.fetchone()["id"]
+    else:
+        cursor = db.execute("""INSERT INTO chat_messages 
+            (room_id, user_id, username, display_name, avatar_color, message, message_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (room_id, user_data["user_id"], user_data["username"],
+             user_data["display_name"], user_data["avatar_color"],
+             message, msg_type))
+        msg_id = cursor.lastrowid
     db.commit()
     db.close()
     
-    # Broadcast to room
     emit("new_message", {
-        "id": msg_id,
-        "room_id": room_id,
+        "id": msg_id, "room_id": room_id,
         "user_id": user_data["user_id"],
         "username": user_data["username"],
         "display_name": user_data["display_name"],
         "avatar_color": user_data["avatar_color"],
-        "message": message,
-        "type": msg_type,
+        "message": message, "type": msg_type,
         "sent_at": datetime.utcnow().isoformat()
     }, room=room_id)
 
@@ -1101,20 +1367,23 @@ def handle_delete_message(data):
 
 
 # ============================================================
-# CLEANUP - Delete old weekly play logs (older than 8 days)
+# CLEANUP
 # ============================================================
 def cleanup_old_data():
-    """Run periodically to clean old trending data."""
     while True:
         try:
             db = get_db_direct()
-            cutoff = (datetime.utcnow() - timedelta(days=8)).isoformat()
-            db.execute("DELETE FROM play_log_weekly WHERE played_at < ?", (cutoff,))
+            if USE_POSTGRES:
+                db.execute("DELETE FROM play_log_weekly WHERE played_at < NOW() - INTERVAL '8 days'")
+            else:
+                cutoff = (datetime.utcnow() - timedelta(days=8)).isoformat()
+                db.execute("DELETE FROM play_log_weekly WHERE played_at < ?", (cutoff,))
             db.commit()
             db.close()
-        except:
-            pass
-        time.sleep(3600)  # Every hour
+        except Exception as e:
+            print(f"[Cleanup] Error: {e}")
+        time.sleep(3600)
+
 
 # ============================================================
 # RUN
@@ -1122,15 +1391,14 @@ def cleanup_old_data():
 if __name__ == "__main__":
     init_db()
     
-    # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_old_data, daemon=True)
     cleanup_thread.start()
     
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
     
-    print(f"[Server] BurritoLauncher API v2.0 starting on port {port}")
-    print(f"[Server] Chat: SocketIO enabled")
+    print(f"[Server] BurritoLauncher API v2.1 starting on port {port}")
+    print(f"[Server] Chat: SocketIO with gevent")
     
     socketio.run(app, host="0.0.0.0", port=port, debug=debug,
                  allow_unsafe_werkzeug=True)
